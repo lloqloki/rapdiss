@@ -5,13 +5,20 @@ local PROTO = "1"
 local BASE_CHANCE = 0.01     -- 1% всем
 local RACE_BONUS = 0.005     -- +0.5%, если есть дисы под твою расу
 local CLASS_BONUS = 0.005    -- +0.5%, если есть дисы под твой класс
-local COOLDOWN = 30          -- секунд между своими дисами (кроме теста)
-local DELAY = 0.8            -- пауза перед дисом после начала боя
+local NAMED_FIRST = 0.05     -- именной дис: доля среди дисов, пока он ни разу не выпадал
+local NAMED_AFTER = 0.01     -- и после того, как выпал
+local BOSS_CHANCE = 0.25     -- первая встреча с боссом за BOSS_MEMORY
+local BOSS_MEMORY = 2 * 3600 -- 2 часа
+local COOLDOWN = 30          -- секунд между своими дисами (кроме теста и первой встречи с боссом)
+local DELAY = 0.8            -- пауза перед дисом; за это время группа решает, кого дисят
 local CHUNK = 200            -- байт текста в одном сообщении аддона
 local MAX_SEEN = 400
 local RANGE = 100            -- "рядом": до 100 м, как обычная речь моба
+local TAKEN_FOR = 120        -- столько секунд моб считается занятым другим игроком группы
 
-local DEFAULTS = { bubble = true, showOthers = true, mass = false, share = true }
+local DEFAULTS = { bubble = true, showOthers = true, mass = false, share = true, voice = false, voiceOthers = false }
+local SOUND_DIR = "Interface\\AddOns\\" .. ADDON .. "\\Sounds\\"
+local GROUP_CH = { PARTY = true, RAID = true, INSTANCE_CHAT = true }
 
 local DB, CharDB
 local testMode = false
@@ -21,7 +28,11 @@ local seen, seenCount = {}, 0
 local nameByGUID = {}
 local cachedTarget = { guid = nil, name = nil, n = 0 }
 local pending, done = {}, {}
+local mine = {}              -- номера своих сообщений: игра присылает их обратно
+local myTag
 local msgCounter = 0
+local claims = {}            -- свои дисы, о которых сказали группе и ждем ответа
+local taken = {}             -- мобы, которые уже дисят другого игрока группы
 
 -- ---------------------------------------------------------------- helpers
 
@@ -47,17 +58,60 @@ local function Print(msg)
 end
 ns.Print = Print
 
+-- имя без фамилии: им подписаны дисы
 local function MyName()
-    return safe(UnitName("player")) or "?"
+    return safe((UnitName("player"))) or "?"
 end
 
-local function ShortName(n)
-    if not n then return nil end
-    if Ambiguate then
-        local ok, s = pcall(Ambiguate, n, "short")
-        if ok and s then return s end
+-- В Forever у персонажа есть фамилия: "Имя", "Фамилия"
+local function MyNames()
+    local first, last = UnitName("player")
+    return safe(first), safe(last)
+end
+
+-- нижний регистр для латиницы и кириллицы (lower() игры кириллицу не трогает), ё = е
+function ns.Fold(s)
+    s = (s or ""):gsub("[A-Z]", function(c) return string.char(c:byte() + 32) end)
+    s = s:gsub("\208([\144-\175])", function(c)
+        local b = c:byte()
+        if b < 160 then return "\208" .. string.char(b + 32) end
+        return "\209" .. string.char(b - 32)
+    end)
+    s = s:gsub("\208\129", "\208\181"):gsub("\209\145", "\208\181"):gsub("%s+", " ")
+    return s
+end
+
+-- полное имя персонажа для именных дисов: "Имя Фамилия", без фамилии - просто имя
+function ns.FullName()
+    local first, last = MyNames()
+    if not first then return nil end
+    if last and last ~= "" then return first .. " " .. last end
+    return first
+end
+
+-- Сообщение от меня самого? Имя приходит по-разному: "Имя", "Имя-Сервер", "Имя Фамилия"...
+-- Главная защита - номера своих сообщений; это запасная, для полного совпадения имени.
+function ns.IsMe(sender)
+    if type(sender) ~= "string" then return false end
+    local first, last = MyNames()
+    if not first then return false end
+    local s = ns.Fold(sender)
+    local forms = {}
+    if last and last ~= "" then
+        forms[ns.Fold(first .. " " .. last)] = true
+        forms[ns.Fold(first .. "-" .. last)] = true
+    else
+        forms[ns.Fold(first)] = true
     end
-    return (n:gsub("%-.*$", ""))
+    if forms[s] then return true end
+    local realm = GetRealmName and safe(GetRealmName())
+    local base = s:match("^(.*)%-[^%-]*$")
+    if realm and base and s == ns.Fold(base .. "-" .. realm) and forms[base] then return true end
+    if not (last and last ~= "") and Ambiguate then
+        local ok, short = pcall(Ambiguate, sender, "short")
+        if ok and type(short) == "string" and forms[ns.Fold(short)] then return true end
+    end
+    return false
 end
 
 function ns.PlayerInfo()
@@ -78,10 +132,21 @@ local function Has(list, v)
     return false
 end
 
+local function IsNamed(d, full)
+    if not d.who then return true end
+    if not full then return false end
+    local f = ns.Fold(full)
+    for _, n in ipairs(d.who) do
+        if ns.Fold(n) == f then return true end
+    end
+    return false
+end
+
+-- обычные дисы для расы и класса (именные идут отдельно, см. ns.Named)
 function ns.Candidates(race, class)
     local out, total = {}, 0
     for i, d in ipairs(ns.DISSES) do
-        if Has(d.race, race) and Has(d.class, class) then
+        if not d.who and Has(d.race, race) and Has(d.class, class) then
             local w = 1
             if d.race and d.class then w = 6 elseif d.race or d.class then w = 3 end
             out[#out + 1] = { i = i, w = w }
@@ -89,6 +154,21 @@ function ns.Candidates(race, class)
         end
     end
     return out, total
+end
+
+-- именные дисы этого персонажа (full - "Имя Фамилия")
+function ns.Named(full)
+    local out = {}
+    for i, d in ipairs(ns.DISSES) do
+        if d.who and IsNamed(d, full) then out[#out + 1] = i end
+    end
+    return out
+end
+
+-- доля именного диса: 5%, пока не выпадал, потом 1%
+function ns.NamedShare(i, seenNamed)
+    local text = ns.DISSES[i].text
+    return (seenNamed and seenNamed[text]) and NAMED_AFTER or NAMED_FIRST
 end
 
 function ns.Chance(race, class)
@@ -110,16 +190,49 @@ function ns.Format(i, name)
     return (text:gsub("{name}", repl))
 end
 
-function ns.Pick(race, class, name, rnd)
+-- full: полное имя для именных дисов; seenNamed: какие именные уже выпадали этому персонажу
+function ns.Pick(race, class, name, rnd, full, seenNamed)
+    rnd = rnd or math.random
+    for _, i in ipairs(ns.Named(full)) do
+        if rnd() < ns.NamedShare(i, seenNamed) then return ns.Format(i, name), i, true end
+    end
     local list, total = ns.Candidates(race, class)
     if total == 0 then return nil end
-    local r = (rnd or math.random)() * total
+    local r = rnd() * total
     for _, c in ipairs(list) do
         r = r - c.w
         if r < 0 then return ns.Format(c.i, name), c.i end
     end
     local last = list[#list]
     return ns.Format(last.i, name), last.i
+end
+
+-- ---------------------------------------------------------------- voice
+-- Записей голоса пока нет: настройки озвучки спрятаны, код ждет файлов Sounds\NN.ogg.
+
+local soundHandle
+
+function ns.SoundPath(i)
+    local d = i and ns.DISSES[i]
+    if not d or not d.snd then return nil end
+    return SOUND_DIR .. d.snd .. ".ogg"
+end
+
+-- Номер диса по тексту: в чужих сообщениях приходит только текст
+function ns.FindDiss(text, victim)
+    for i in ipairs(ns.DISSES) do
+        if ns.Format(i, victim) == text then return i end
+    end
+    return nil
+end
+
+function ns.PlayDiss(i)
+    local path = ns.SoundPath(i)
+    if not path or not PlaySoundFile then return false end
+    if soundHandle and StopSound then pcall(StopSound, soundHandle, 300) end
+    local ok, willPlay, handle = pcall(PlaySoundFile, path, "Master")
+    soundHandle = ok and willPlay and handle or nil
+    return (ok and willPlay) and true or false
 end
 
 -- ---------------------------------------------------------------- bubble
@@ -221,15 +334,20 @@ end
 
 -- ---------------------------------------------------------------- sharing
 
+local function GroupChannel()
+    if IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) and not IsInGroup(LE_PARTY_CATEGORY_HOME) then
+        return "INSTANCE_CHAT"
+    elseif IsInRaid and IsInRaid() then
+        return "RAID"
+    elseif IsInGroup and IsInGroup() then
+        return "PARTY"
+    end
+end
+
 local function Channels(isTest)
     local list = {}
-    if IsInGroup and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) and not IsInGroup(LE_PARTY_CATEGORY_HOME) then
-        list[#list + 1] = "INSTANCE_CHAT"
-    elseif IsInRaid and IsInRaid() then
-        list[#list + 1] = "RAID"
-    elseif IsInGroup and IsInGroup() then
-        list[#list + 1] = "PARTY"
-    end
+    local g = GroupChannel()
+    if g then list[#list + 1] = g end
     if not isTest and IsInGuild and IsInGuild() then
         list[#list + 1] = "GUILD"
     end
@@ -254,6 +372,17 @@ local function Clean(s)
     return ((s or ""):gsub("[\t\r\n]", " "))
 end
 
+-- номер нового своего сообщения; запоминается, чтобы не показать свой дис второй раз
+local function NewID()
+    if not myTag then
+        myTag = string.format("%x%x", math.floor((GetTime() or 0) * 1000) % 0x1000000, math.floor(math.random() * 0x1000000))
+    end
+    msgCounter = msgCounter + 1
+    local id = myTag .. "." .. msgCounter
+    mine[id] = true
+    return id
+end
+
 -- Мировые координаты игрока в ярдах (в подземельях игра их не дает - тогда nil)
 function ns.Position()
     if not UnitPosition then return nil end
@@ -276,8 +405,7 @@ end
 local function Share(mob, guid, victim, text)
     if not DB.settings.share then return end
     if not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return end
-    msgCounter = msgCounter + 1
-    local id = string.format("%s%d%d", MyName(), math.floor(GetTime()), msgCounter)
+    local id = NewID()
     local mapID = C_Map and C_Map.GetBestMapForUnit and safe(C_Map.GetBestMapForUnit("player")) or 0
     local msgs = ns.Encode(id, mob, guid, victim, mapID, text, ns.Position())
     for _, ch in ipairs(Channels(testMode)) do
@@ -286,6 +414,63 @@ local function Share(mob, guid, victim, text)
         end
     end
 end
+
+-- ---------------------------------------------------------------- one victim per mob in a group
+-- Перед дисом аддон говорит группе "этот моб мой" с жребием. Кто вытянул меньший жребий,
+-- того и дисят; остальным этот моб уже не дисит. Моб узнается по GUID, а если его не видно - по имени.
+
+local function SameMob(g1, n1, g2, n2)
+    if g1 and g1 ~= "" and g2 and g2 ~= "" then return g1 == g2 end
+    return n1 ~= nil and n1 ~= "" and n1 == n2
+end
+
+local function Take(guid, name)
+    taken[#taken + 1] = { guid = guid, name = name, t = GetTime() }
+end
+
+function ns.Taken(guid, name)
+    local now, keep, hit = GetTime(), {}, false
+    for _, x in ipairs(taken) do
+        if now - x.t <= TAKEN_FOR then
+            keep[#keep + 1] = x
+            if SameMob(guid, name, x.guid, x.name) then hit = true end
+        end
+    end
+    taken = keep
+    return hit
+end
+
+-- сказать группе о своем дисе; nil, если группы нет
+function ns.Claim(guid, name)
+    local ch = GroupChannel()
+    if not ch or not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return nil end
+    local c = { guid = guid, name = name, token = math.random(1, 999999999) }
+    local msg = table.concat({ PROTO, "C", NewID(), Clean(guid), Clean(name), c.token }, "\t")
+    pcall(C_ChatInfo.SendAddonMessage, PREFIX, msg, ch)
+    claims[c] = true
+    return c
+end
+
+-- другой игрок группы проиграл бы мне - значит, моб мой; иначе моб его
+local function OnClaim(f)
+    local guid, name, token = f[4] or "", f[5] or "", tonumber(f[6]) or 0
+    local mineWins = false
+    for c in pairs(claims) do
+        if not c.lost and SameMob(c.guid, c.name, guid, name) then
+            if token < c.token then c.lost = true else mineWins = true end
+        end
+    end
+    if not mineWins then Take(guid, name) end
+end
+
+-- моб уже дисит другого игрока группы: свои ожидающие дисы на него отменяются
+local function LoseClaims(guid, name)
+    for c in pairs(claims) do
+        if SameMob(c.guid, c.name, guid, name) then c.lost = true end
+    end
+end
+
+-- ---------------------------------------------------------------- receiving
 
 local function ZoneName(mapID)
     mapID = tonumber(mapID)
@@ -312,7 +497,8 @@ end
 local function ShowRemote(m)
     done[m.id] = true
     pending[m.id] = nil
-    if not DB.settings.mass and not ns.IsNear(m) then return end
+    local near = ns.IsNear(m)
+    if not DB.settings.mass and not near then return end
     CountSeen(m.victim)
     if not DB.settings.showOthers then return end
     local buf = {}
@@ -322,17 +508,35 @@ local function ShowRemote(m)
     if m.guid ~= "" and m.guid == cachedTarget.guid then
         ns.ShowBubble(text, m.guid)
     end
+    -- голос слышно только рядом, даже при массовом отображении
+    if DB.settings.voiceOthers and near then
+        ns.PlayDiss(ns.FindDiss(text, m.victim))
+    end
 end
 
 function ns.OnAddonMessage(prefix, msg, channel, sender)
     if prefix ~= PREFIX or type(msg) ~= "string" then return end
-    local who = ShortName(sender)
-    if who == MyName() then return end
     local f = {}
     for x in (msg .. "\t"):gmatch("(.-)\t") do f[#f + 1] = x end
     if f[1] ~= PROTO then return end
     local kind, id = f[2], f[3]
-    if not id or done[id] then return end
+    if not id or id == "" or mine[id] then return end   -- свое сообщение вернулось
+    if ns.IsMe(sender) then return end
+    if kind == "C" then
+        if GROUP_CH[channel] then OnClaim(f) end
+        return
+    end
+    -- моба из группы уже дисят: он мой больше не дисит (до проверки повторов - та же копия идет и гильдии)
+    if kind == "H" and GROUP_CH[channel] then
+        Take(f[6] or "", f[5] or "")
+        LoseClaims(f[6] or "", f[5] or "")
+    end
+    if done[id] then return end
+    local who = sender or "?"
+    if Ambiguate then
+        local ok, s = pcall(Ambiguate, who, "short")
+        if ok and type(s) == "string" and s ~= "" then who = s end
+    end
     local m = pending[id]
     if not m then
         m = { id = id, parts = {}, got = 0, t = GetTime() }
@@ -351,6 +555,7 @@ function ns.OnAddonMessage(prefix, msg, channel, sender)
             m.got = m.got + 1
         end
     else
+        pending[id] = nil
         return
     end
     if m.n and m.got >= m.n then ShowRemote(m) end
@@ -358,6 +563,50 @@ function ns.OnAddonMessage(prefix, msg, channel, sender)
     for k, v in pairs(pending) do
         if GetTime() - v.t > 30 then pending[k] = nil end
     end
+end
+
+-- ---------------------------------------------------------------- bosses
+
+local journalBosses
+-- npcID боссов из ForeverDungeonJournal, если он стоит
+local function JournalBosses()
+    if journalBosses then return journalBosses end
+    journalBosses = {}
+    local FDJ = _G.ForeverDungeonJournal_NS
+    if type(FDJ) == "table" and type(FDJ.DB) == "table" then
+        for _, d in pairs(FDJ.DB) do
+            for _, b in ipairs(type(d) == "table" and d.bosses or {}) do
+                if tonumber(b.npcID) then journalBosses[tonumber(b.npcID)] = true end
+            end
+        end
+    end
+    return journalBosses
+end
+
+function ns.NpcID(guid)
+    return guid and tonumber(guid:match("^%a+%-%d+%-%d+%-%d+%-%d+%-(%d+)%-")) or nil
+end
+
+-- цель - босс? По признакам игры (рамки боссов, "босс", череп) и по списку боссов журнала
+function ns.TargetIsBoss(guid)
+    if flag(UnitIsBossMob, "target") == true then return true end
+    local ok, cls = pcall(UnitClassification, "target")
+    if ok and safe(cls) == "worldboss" then return true end
+    if safe(UnitLevel("target")) == -1 then return true end
+    for i = 1, 5 do
+        if flag(UnitIsUnit, "target", "boss" .. i) == true then return true end
+    end
+    local npc = ns.NpcID(guid)
+    return npc ~= nil and JournalBosses()[npc] == true
+end
+
+-- первая встреча с этим боссом за 2 часа? Встреча запоминается.
+function ns.MeetBoss(key)
+    if not key then return false end
+    local now = time()
+    local last = CharDB.bosses[key]
+    CharDB.bosses[key] = now
+    return not last or now - last >= BOSS_MEMORY
 end
 
 -- ---------------------------------------------------------------- combat
@@ -404,11 +653,13 @@ end
 function ns.Diss(mob, guid, onTarget)
     local race, class = ns.PlayerInfo()
     local me = MyName()
-    local text = ns.Pick(race, class, me)
+    local text, idx, named = ns.Pick(race, class, me, nil, ns.FullName(), CharDB.namedSeen)
     if not text then return end
+    if named then CharDB.namedSeen[ns.DISSES[idx].text] = true end
     mob = mob or "Моб"
     ns.ChatLine(mob, me, text)
     if onTarget then ns.ShowBubble(text, guid) end
+    if DB.settings.voice then ns.PlayDiss(idx) end
     CharDB.count = CharDB.count + 1
     CharDB.byMob[mob] = (CharDB.byMob[mob] or 0) + 1
     CharDB.last = { t = time(), mob = mob, text = text }
@@ -425,15 +676,26 @@ function ns.Check()
     local key = TargetKey()
     if seen[key] then return end
     Remember(key)
-    if not testMode and GetTime() - lastDiss < COOLDOWN then return end
+    local guid, mob, n = cachedTarget.guid, cachedTarget.name, cachedTarget.n
+    local firstBoss = ns.TargetIsBoss(guid) and ns.MeetBoss(ns.NpcID(guid) or mob)
+    if not testMode and not firstBoss and GetTime() - lastDiss < COOLDOWN then return end
     local race, class = ns.PlayerInfo()
-    local chance = testMode and 1 or ns.Chance(race, class)
+    local chance = testMode and 1 or (firstBoss and BOSS_CHANCE or ns.Chance(race, class))
     if math.random() >= chance then return end
+    if ns.Taken(guid, mob) then return end          -- этот моб уже дисит другого из группы
+    local before = lastDiss
     lastDiss = GetTime()
     fightDissed = true
-    local guid, mob, n = cachedTarget.guid, cachedTarget.name, cachedTarget.n
+    local c = ns.Claim(guid, mob)
     C_Timer.After(DELAY, function()
-        -- цель сменилась - моб всё равно дисит, но пузырь только над своей целью
+        if c then claims[c] = nil end
+        if (c and c.lost) or ns.Taken(guid, mob) then
+            -- дис достался другому игроку группы: этот бой и пауза не потрачены
+            lastDiss = before
+            fightDissed = false
+            return
+        end
+        -- цель сменилась - моб все равно дисит, но пузырь только над своей целью
         ns.Diss(mob, guid, cachedTarget.n == n)
     end)
 end
@@ -495,10 +757,23 @@ function ns.Stats()
     if next(DB.guild) then
         Print("кого дисили при тебе: " .. Top(DB.guild, 5))
     end
-    Print(string.format("шанс диса: %.1f%%%s;   пузырь: %s;   чужие дисы: %s.",
-        (testMode and 1 or ns.Chance(race, class)) * 100, testMode and " (тест)" or "",
+    Print(string.format("шанс диса: %.1f%%%s, босс при первой встрече за 2 часа: %d%%;   пузырь: %s;   чужие дисы: %s.",
+        (testMode and 1 or ns.Chance(race, class)) * 100, testMode and " (тест)" or "", BOSS_CHANCE * 100,
         DB.settings.bubble and "вкл" or "выкл",
         not DB.settings.showOthers and "выкл" or (DB.settings.mass and "вся гильдия" or "только рядом")))
+end
+
+-- "вкл" / "выкл" в конце команды, иначе переключить
+local function Toggle(key, msg)
+    local arg = msg:match("%s(%S+)$")
+    if arg == "вкл" or arg == "on" then
+        DB.settings[key] = true
+    elseif arg == "выкл" or arg == "off" then
+        DB.settings[key] = false
+    else
+        DB.settings[key] = not DB.settings[key]
+    end
+    return DB.settings[key]
 end
 
 local function RapCommand(msg)
@@ -509,15 +784,7 @@ local function RapCommand(msg)
     elseif msg == "настройки" or msg == "options" or msg == "config" then
         OpenSettings()
     elseif msg:match("^бабл") or msg:match("^пузырь") or msg:match("^bubble") then
-        local arg = msg:match("%s(%S+)$")
-        if arg == "вкл" or arg == "on" then
-            DB.settings.bubble = true
-        elseif arg == "выкл" or arg == "off" then
-            DB.settings.bubble = false
-        else
-            DB.settings.bubble = not DB.settings.bubble
-        end
-        Print("пузырь над портретом " .. (DB.settings.bubble and "включен." or "выключен."))
+        Print("пузырь над портретом " .. (Toggle("bubble", msg) and "включен." or "выключен."))
     elseif msg == "масс" or msg == "все" or msg == "mass" then
         DB.settings.mass = not DB.settings.mass
         Print(DB.settings.mass and "видишь дисы всей гильдии." or "видишь только дисы рядом с тобой.")
@@ -562,6 +829,13 @@ local function Init()
     DB.guild = DB.guild or {}
     CharDB.count = CharDB.count or 0
     CharDB.byMob = CharDB.byMob or {}
+    CharDB.namedSeen = type(CharDB.namedSeen) == "table" and CharDB.namedSeen or {}
+    -- встречи с боссами старше 2 часов больше не нужны
+    CharDB.bosses = type(CharDB.bosses) == "table" and CharDB.bosses or {}
+    local now = time()
+    for k, t in pairs(CharDB.bosses) do
+        if type(t) ~= "number" or now - t >= BOSS_MEMORY then CharDB.bosses[k] = nil end
+    end
     if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
         pcall(C_ChatInfo.RegisterAddonMessagePrefix, PREFIX)
     end

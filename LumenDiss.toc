@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: Lumen Diss
-## Notes: Мобы иногда дисят игрока. Дисы видят все, у кого стоит аддон. /rap, /diss
-## Version: 1.0.0
+## Notes: Мобы иногда дисят игрока, боссы при первой встрече - чаще. Дисы видят все, у кого стоит аддон. /rap, /diss
+## Version: 1.1.0
 ## IconTexture: Interface\Icons\INV_Misc_Drum_01
 ## SavedVariables: LumenDissDB
 ## SavedVariablesPerCharacter: LumenDissCharDB
