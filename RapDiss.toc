@@ -1,0 +1,10 @@
+## Interface: 16001
+## Title: RapDiss
+## Notes: Мобы иногда дисят игрока рэп-строчками, боссы при первой встрече - чаще. Дисы видят все, у кого стоит аддон. /rap, /diss
+## Version: 1.2.0
+## IconTexture: Interface\Icons\INV_Misc_Drum_01
+## SavedVariables: RapDissDB
+## SavedVariablesPerCharacter: RapDissCharDB
+
+Data.lua
+RapDiss.lua

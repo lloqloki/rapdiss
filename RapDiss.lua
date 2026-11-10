@@ -1,6 +1,8 @@
 local ADDON, ns = ...
 
+-- Аддон раньше назывался Lumen Diss. Имя для сообщений аддона прежнее, чтобы версии видели дисы друг друга.
 local PREFIX = "LumenDiss"
+local OLD_ADDON = "LumenDiss"
 local PROTO = "1"
 local BASE_CHANCE = 0.01     -- 1% всем
 local RACE_BONUS = 0.005     -- +0.5%, если есть дисы под твою расу
@@ -16,7 +18,40 @@ local MAX_SEEN = 400
 local RANGE = 100            -- "рядом": до 100 м, как обычная речь моба
 local TAKEN_FOR = 120        -- столько секунд моб считается занятым другим игроком группы
 
-local DEFAULTS = { bubble = true, showOthers = true, mass = false, share = true, voice = false, voiceOthers = false }
+local BOOST = 2              -- "повышенные дисы": обычный шанс x2 (боссы не меняются)
+
+local DEFAULTS = {
+    bubble = true, bubbleStyle = "tooltip", bubbleScale = 100, bubbleTime = 0, bubbleOffset = 10,
+    chat = true, boost = false,
+    showOthers = true, mass = false, share = true, voice = false, voiceOthers = false,
+}
+-- границы чисел в настройках
+local LIMITS = { bubbleScale = { 50, 200 }, bubbleTime = { 0, 15 }, bubbleOffset = { 0, 100 } }
+
+-- дизайны пузыря
+local WHITE = "Interface\\Buttons\\WHITE8X8"
+local STYLES = {
+    { key = "tooltip", label = "Подсказка",
+      backdrop = { bgFile = "Interface\\Tooltips\\UI-Tooltip-Background", edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                   edgeSize = 14, insets = { left = 3, right = 3, top = 3, bottom = 3 } },
+      bg = { 0, 0, 0, 0.8 }, border = { 0.9, 0.9, 0.9, 0.9 }, text = { 1, 1, 1 }, tail = true },
+    { key = "dark", label = "Темный",
+      backdrop = { bgFile = WHITE, edgeFile = WHITE, edgeSize = 1 },
+      bg = { 0.05, 0.05, 0.06, 0.88 }, border = { 0.35, 0.36, 0.4, 1 }, text = { 0.93, 0.93, 0.93 } },
+    { key = "rap", label = "Рэп",
+      backdrop = { bgFile = WHITE, edgeFile = WHITE, edgeSize = 2 },
+      bg = { 0, 0, 0, 0.9 }, border = { 1, 0.48, 0.24, 1 }, text = { 1, 0.85, 0.6 } },
+    { key = "scroll", label = "Свиток",
+      backdrop = { bgFile = WHITE, edgeFile = WHITE, edgeSize = 2 },
+      bg = { 0.93, 0.87, 0.72, 0.96 }, border = { 0.45, 0.3, 0.15, 1 }, text = { 0.25, 0.15, 0.05 }, noShadow = true },
+    { key = "text", label = "Только текст", text = { 1, 0.82, 0.3 }, outline = true },
+}
+ns.STYLES = STYLES
+
+local function StyleOf(key)
+    for _, s in ipairs(STYLES) do if s.key == key then return s end end
+    return STYLES[1]
+end
 local SOUND_DIR = "Interface\\AddOns\\" .. ADDON .. "\\Sounds\\"
 local GROUP_CH = { PARTY = true, RAID = true, INSTANCE_CHAT = true }
 
@@ -54,7 +89,7 @@ local function flag(f, ...)
 end
 
 local function Print(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff7a3dLumen Diss:|r " .. msg)
+    DEFAULT_CHAT_FRAME:AddMessage("|cffff7a3dRapDiss:|r " .. msg)
 end
 ns.Print = Print
 
@@ -184,6 +219,13 @@ function ns.Chance(race, class)
     return c
 end
 
+-- шанс обычного диса с учетом режима повышенных дисов (на боссов не влияет)
+function ns.EffectiveChance(race, class)
+    local c = ns.Chance(race, class)
+    if DB and DB.settings.boost then c = c * BOOST end
+    return c
+end
+
 function ns.Format(i, name)
     local text = ns.DISSES[i].text
     local repl = (name or ""):gsub("%%", "%%%%")
@@ -247,23 +289,16 @@ local function PortraitAnchor()
 end
 
 local function CreateBubble()
-    local f = CreateFrame("Frame", "LumenDissBubble", UIParent, "BackdropTemplate")
+    local f = CreateFrame("Frame", "RapDissBubble", UIParent, "BackdropTemplate")
     f:SetFrameStrata("HIGH")
     f:SetClampedToScreen(true)
-    f:SetBackdrop({
-        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        edgeSize = 14,
-        insets = { left = 3, right = 3, top = 3, bottom = 3 },
-    })
-    f:SetBackdropColor(0, 0, 0, 0.8)
-    f:SetBackdropBorderColor(0.9, 0.9, 0.9, 0.9)
 
     f.text = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     f.text:SetPoint("CENTER")
     f.text:SetJustifyH("CENTER")
     f.text:SetJustifyV("MIDDLE")
     f.text:SetWordWrap(true)
+    f.font, f.fontSize = f.text:GetFont()
 
     f.tail = f:CreateTexture(nil, "OVERLAY")
     f.tail:SetTexture("Interface\\Tooltips\\ChatBubble-Tail")
@@ -282,11 +317,31 @@ local function CreateBubble()
     return f
 end
 
-function ns.ShowBubble(text, guid)
-    if not DB.settings.bubble then return false end
+-- дизайн и размер из настроек
+local function ApplyStyle(f)
+    local st = StyleOf(DB.settings.bubbleStyle)
+    if st.backdrop then
+        f:SetBackdrop(st.backdrop)
+        f:SetBackdropColor(st.bg[1], st.bg[2], st.bg[3], st.bg[4])
+        f:SetBackdropBorderColor(st.border[1], st.border[2], st.border[3], st.border[4])
+    else
+        f:SetBackdrop(nil)
+    end
+    f.text:SetTextColor(st.text[1], st.text[2], st.text[3])
+    if f.font then f.text:SetFont(f.font, f.fontSize or 12, st.outline and "OUTLINE" or "") end
+    if st.noShadow then f.text:SetShadowOffset(0, 0) else f.text:SetShadowOffset(1, -1) end
+    f.tail:SetShown(st.tail and true or false)
+    f:SetScale((DB.settings.bubbleScale or 100) / 100)
+    f.style = st.key
+end
+
+-- preview: пример из настроек - виден и с выключенным пузырем, а без цели посреди экрана
+function ns.ShowBubble(text, guid, preview)
+    if not DB.settings.bubble and not preview then return false end
     local anchor = PortraitAnchor()
-    if not anchor then return false end
+    if not anchor and not preview then return false end
     bubble = bubble or CreateBubble()
+    ApplyStyle(bubble)
     local maxW = 260
     bubble.text:SetWidth(maxW)
     bubble.text:SetText(text)
@@ -296,14 +351,30 @@ function ns.ShowBubble(text, guid)
     end
     bubble.text:SetWidth(w)
     local h = bubble.text:GetStringHeight() or 14
-    bubble:SetSize(w + 22, h + 18)
+    local bare = bubble.style == "text"
+    bubble:SetSize(w + (bare and 4 or 22), h + (bare and 4 or 18))
     bubble:ClearAllPoints()
-    bubble:SetPoint("BOTTOM", anchor, "TOP", 0, 10)
-    bubble.guid = guid
-    bubble.left = math.min(12, 5 + #text / 40)
+    if anchor then
+        bubble:SetPoint("BOTTOM", anchor, "TOP", 0, DB.settings.bubbleOffset)
+    else
+        bubble:SetPoint("CENTER", UIParent, "CENTER", 0, 150)
+    end
+    bubble.guid, bubble.shownText, bubble.preview = guid, text, preview
+    local t = DB.settings.bubbleTime
+    bubble.left = (t and t > 0) and t or math.min(12, 5 + #text / 40)
     bubble:SetAlpha(1)
     bubble:Show()
     return true
+end
+
+-- настройки поменялись: показанный пузырь сразу в новом виде
+function ns.RefreshBubble()
+    if not (bubble and bubble:IsShown() and bubble.shownText) then return end
+    if not ns.ShowBubble(bubble.shownText, bubble.guid, bubble.preview) then bubble:Hide() end
+end
+
+function ns.Preview()
+    return ns.ShowBubble("Так выглядит дис: твой реп - это полный провал", cachedTarget.guid, true)
 end
 
 local function HideBubbleIfOtherTarget()
@@ -504,7 +575,7 @@ local function ShowRemote(m)
     local buf = {}
     for k = 1, m.n do buf[k] = m.parts[k] or "" end
     local text = table.concat(buf)
-    ns.ChatLine(m.mob ~= "" and m.mob or "Моб", m.victim, text, ZoneName(m.map))
+    if DB.settings.chat then ns.ChatLine(m.mob ~= "" and m.mob or "Моб", m.victim, text, ZoneName(m.map)) end
     if m.guid ~= "" and m.guid == cachedTarget.guid then
         ns.ShowBubble(text, m.guid)
     end
@@ -657,7 +728,7 @@ function ns.Diss(mob, guid, onTarget)
     if not text then return end
     if named then CharDB.namedSeen[ns.DISSES[idx].text] = true end
     mob = mob or "Моб"
-    ns.ChatLine(mob, me, text)
+    if DB.settings.chat then ns.ChatLine(mob, me, text) end
     if onTarget then ns.ShowBubble(text, guid) end
     if DB.settings.voice then ns.PlayDiss(idx) end
     CharDB.count = CharDB.count + 1
@@ -669,7 +740,7 @@ function ns.Diss(mob, guid, onTarget)
 end
 
 function ns.Check()
-    if not DB then return end
+    if not DB or ns.passive then return end
     if flag(UnitAffectingCombat, "player") == false then fightDissed = false end
     if fightDissed then return end
     if not FightingTarget() then return end
@@ -680,7 +751,7 @@ function ns.Check()
     local firstBoss = ns.TargetIsBoss(guid) and ns.MeetBoss(ns.NpcID(guid) or mob)
     if not testMode and not firstBoss and GetTime() - lastDiss < COOLDOWN then return end
     local race, class = ns.PlayerInfo()
-    local chance = testMode and 1 or (firstBoss and BOSS_CHANCE or ns.Chance(race, class))
+    local chance = testMode and 1 or (firstBoss and BOSS_CHANCE or ns.EffectiveChance(race, class))
     if math.random() >= chance then return end
     if ns.Taken(guid, mob) then return end          -- этот моб уже дисит другого из группы
     local before = lastDiss
@@ -702,21 +773,74 @@ end
 
 -- ---------------------------------------------------------------- settings
 
+-- Окно "Настройки -> AddOns -> RapDiss". Каждый пункт ставится отдельно: если игра не знает
+-- какого-то элемента, остальные все равно появятся. Все то же есть и командами /rap.
 local function RegisterSettings()
     if not (Settings and Settings.RegisterVerticalLayoutCategory and Settings.RegisterAddOnSetting) then return end
     local ok = pcall(function()
-        local cat = Settings.RegisterVerticalLayoutCategory("Lumen Diss")
-        local function box(key, name, tip)
-            local s = Settings.RegisterAddOnSetting(cat, "LumenDiss_" .. key, key, DB.settings, "boolean", name, DEFAULTS[key])
-            Settings.CreateCheckbox(cat, s, tip)
+        local cat, layout = Settings.RegisterVerticalLayoutCategory("RapDiss")
+        local function setting(key, name)
+            local s = Settings.RegisterAddOnSetting(cat, "RapDiss_" .. key, key, DB.settings, type(DEFAULTS[key]), name, DEFAULTS[key])
+            if s and s.SetValueChangedCallback then
+                pcall(s.SetValueChangedCallback, s, function() ns.RefreshBubble() end)
+            end
+            return s
         end
-        box("bubble", "Пузырь с дисом над портретом моба",
-            "Показывать текст диса над портретом цели. Строка в чате будет в любом случае.")
-        box("showOthers", "Показывать дисы согильдийцев",
-            "Строки в чате, когда мобы дисят других игроков с аддоном.")
-        box("mass", "Массовое отображение",
+        local function header(text)
+            if layout and CreateSettingsListSectionHeaderInitializer then
+                layout:AddInitializer(CreateSettingsListSectionHeaderInitializer(text))
+            end
+        end
+        local function box(key, name, tip)
+            Settings.CreateCheckbox(cat, setting(key, name), tip)
+        end
+        local function slider(key, name, tip, step, label)
+            local s = setting(key, name)
+            local lim = LIMITS[key]
+            local o = Settings.CreateSliderOptions(lim[1], lim[2], step)
+            if o.SetLabelFormatter and MinimalSliderWithSteppersMixin then
+                o:SetLabelFormatter(MinimalSliderWithSteppersMixin.Label.Right, label)
+            end
+            Settings.CreateSlider(cat, s, o, tip)
+        end
+        local function styles()
+            local c = Settings.CreateControlTextContainer()
+            for _, st in ipairs(STYLES) do c:Add(st.key, st.label) end
+            return c:GetData()
+        end
+        local function try(fn, ...) pcall(fn, ...) end
+
+        try(header, "Пузырь над портретом")
+        try(box, "bubble", "Пузырь с дисом",
+            "Показывать текст диса над портретом цели.")
+        try(function()
+            local s = setting("bubbleStyle", "Дизайн")
+            local create = Settings.CreateDropdown or Settings.CreateDropDown
+            create(cat, s, styles, "Как выглядит пузырь: подсказка, темный, рэп, свиток или только текст.")
+        end)
+        try(slider, "bubbleScale", "Размер", "Размер пузыря и текста в нем.", 10,
+            function(v) return string.format("%d%%", v) end)
+        try(slider, "bubbleTime", "Время на экране", "Сколько секунд держится пузырь. Авто - дольше для длинных дисов.", 1,
+            function(v) return v == 0 and "авто" or string.format("%d с", v) end)
+        try(slider, "bubbleOffset", "Высота над портретом", "На сколько выше портрета цели стоит пузырь.", 5,
+            function(v) return tostring(v) end)
+        try(function()
+            if layout and CreateSettingsButtonInitializer then
+                layout:AddInitializer(CreateSettingsButtonInitializer("Пример пузыря", "Показать",
+                    function() ns.Preview() end, "Показать пузырь с текущими настройками.", true))
+            end
+        end)
+        try(header, "Чат")
+        try(box, "chat", "Строка с дисом в чате",
+            "Писать дисы в чат. Выключено: дис виден только в пузыре.")
+        try(header, "Дисы")
+        try(box, "boost", "Повышенные дисы",
+            "Обычный шанс диса x2. У боссов шанс прежний.")
+        try(box, "showOthers", "Показывать дисы согильдийцев",
+            "Когда мобы дисят других игроков с аддоном.")
+        try(box, "mass", "Массовое отображение",
             "Показывать дисы всех согильдийцев с аддоном, где бы они ни были. Выключено: только тех, кто рядом с тобой (до 100 м).")
-        box("share", "Делиться своими дисами",
+        try(box, "share", "Делиться своими дисами",
             "Отправлять свои дисы гильдии и группе, чтобы их видели все с аддоном.")
         Settings.RegisterAddOnCategory(cat)
         ns.category = cat
@@ -758,9 +882,51 @@ function ns.Stats()
         Print("кого дисили при тебе: " .. Top(DB.guild, 5))
     end
     Print(string.format("шанс диса: %.1f%%%s, босс при первой встрече за 2 часа: %d%%;   пузырь: %s;   чужие дисы: %s.",
-        (testMode and 1 or ns.Chance(race, class)) * 100, testMode and " (тест)" or "", BOSS_CHANCE * 100,
-        DB.settings.bubble and "вкл" or "выкл",
+        (testMode and 1 or ns.EffectiveChance(race, class)) * 100,
+        testMode and " (тест)" or (DB.settings.boost and " (повышенные дисы)" or ""), BOSS_CHANCE * 100,
+        DB.settings.bubble and (StyleOf(DB.settings.bubbleStyle).label .. ", " .. DB.settings.bubbleScale .. "%") or "выкл",
         not DB.settings.showOthers and "выкл" or (DB.settings.mass and "вся гильдия" or "только рядом")))
+end
+
+-- /rap стиль [название]: без названия - следующий дизайн
+function ns.SetStyle(arg)
+    arg = ns.Fold(arg or "")
+    local pick
+    if arg == "" then
+        for i, st in ipairs(STYLES) do
+            if st.key == DB.settings.bubbleStyle then pick = STYLES[i % #STYLES + 1] end
+        end
+        pick = pick or STYLES[1]
+    else
+        for _, st in ipairs(STYLES) do
+            local label = ns.Fold(st.label)
+            if st.key == arg or label:sub(1, #arg) == arg then pick = pick or st end
+        end
+    end
+    if not pick then
+        local names = {}
+        for _, st in ipairs(STYLES) do names[#names + 1] = ns.Fold(st.label) end
+        Print("нет такого дизайна. Есть: " .. table.concat(names, ", ") .. ".")
+        return false
+    end
+    DB.settings.bubbleStyle = pick.key
+    Print("дизайн пузыря: " .. pick.label .. ".")
+    ns.Preview()
+    return true
+end
+
+-- /rap размер 150
+function ns.SetScale(arg)
+    local n = tonumber(((arg or ""):gsub("%%", "")))
+    local lim = LIMITS.bubbleScale
+    if not n or n < lim[1] or n > lim[2] then
+        Print(string.format("размер пузыря от %d до %d%%, сейчас %d%%. Пример: /rap размер 150", lim[1], lim[2], DB.settings.bubbleScale))
+        return false
+    end
+    DB.settings.bubbleScale = math.floor(n + 0.5)
+    Print(string.format("размер пузыря: %d%%.", DB.settings.bubbleScale))
+    ns.Preview()
+    return true
 end
 
 -- "вкл" / "выкл" в конце команды, иначе переключить
@@ -777,23 +943,38 @@ local function Toggle(key, msg)
 end
 
 local function RapCommand(msg)
-    -- lower() только для латиницы: на кириллице он зависит от локали
-    msg = (msg or ""):gsub("[A-Z]", string.lower):gsub("^%s+", ""):gsub("%s+$", "")
+    if not DB then return end
+    if ns.passive then Print("сначала сделай /reload: старый Lumen Diss еще работает до перезагрузки.") return end
+    msg = ns.Fold(msg):gsub("^%s+", ""):gsub("%s+$", "")
+    local cmd, arg = msg:match("^(%S*)%s*(.-)$")
     if msg == "" then
         ns.Stats()
-    elseif msg == "настройки" or msg == "options" or msg == "config" then
+    elseif cmd == "настройки" or cmd == "options" or cmd == "config" then
         OpenSettings()
-    elseif msg:match("^бабл") or msg:match("^пузырь") or msg:match("^bubble") then
+    elseif cmd == "бабл" or cmd == "пузырь" or cmd == "bubble" then
         Print("пузырь над портретом " .. (Toggle("bubble", msg) and "включен." or "выключен."))
-    elseif msg == "масс" or msg == "все" or msg == "mass" then
+    elseif cmd == "пример" or cmd == "preview" then
+        ns.Preview()
+    elseif cmd == "стиль" or cmd == "дизайн" or cmd == "style" then
+        ns.SetStyle(arg)
+    elseif cmd == "размер" or cmd == "size" then
+        ns.SetScale(arg)
+    elseif cmd == "чат" or cmd == "chat" then
+        Print("строка с дисом в чате " .. (Toggle("chat", msg) and "включена." or "выключена."))
+    elseif cmd == "x2" or cmd == "х2" or cmd == "буст" or cmd == "boost" then
+        Print(Toggle("boost", msg) and "повышенные дисы включены: обычный шанс x2, у боссов прежний."
+            or "повышенные дисы выключены.")
+    elseif cmd == "масс" or cmd == "все" or cmd == "mass" then
         DB.settings.mass = not DB.settings.mass
         Print(DB.settings.mass and "видишь дисы всей гильдии." or "видишь только дисы рядом с тобой.")
     else
-        Print("/rap - сколько тебя задисили;   /rap бабл - вкл/выкл пузырь;   /rap масс - дисы всей гильдии или только рядом;   /rap настройки;   /diss - тест 100%")
+        Print("/rap - статистика;   /rap настройки;   /rap x2 - повышенные дисы;   /rap бабл - пузырь вкл/выкл;   /rap стиль [название];   /rap размер 50-200;   /rap пример;   /rap чат;   /rap масс;   /diss - тест 100%")
     end
 end
 
 local function DissCommand()
+    if not DB then return end
+    if ns.passive then Print("сначала сделай /reload: старый Lumen Diss еще работает до перезагрузки.") return end
     testMode = not testMode
     if testMode then
         seen, seenCount = {}, 0
@@ -818,15 +999,57 @@ SlashCmdList.LUMENDISS = DissCommand
 local ev = CreateFrame("Frame")
 ns.events = ev
 
-local function Init()
-    LumenDissDB = LumenDissDB or {}
-    LumenDissCharDB = LumenDissCharDB or {}
-    DB, CharDB = LumenDissDB, LumenDissCharDB
-    DB.settings = DB.settings or {}
-    for k, v in pairs(DEFAULTS) do
-        if DB.settings[k] == nil then DB.settings[k] = v end
+local function Copy(t)
+    if type(t) ~= "table" then return t end
+    local c = {}
+    for k, v in pairs(t) do c[k] = Copy(v) end
+    return c
+end
+
+local function OldLoaded()
+    local isLoaded = (C_AddOns and C_AddOns.IsAddOnLoaded) or IsAddOnLoaded
+    if isLoaded then
+        local ok, v = pcall(isLoaded, OLD_ADDON)
+        if ok and v then return true end
     end
-    DB.guild = DB.guild or {}
+    return type(_G.LumenDissDB) == "table"
+end
+
+-- Переезд с Lumen Diss: статистика и настройки переносятся один раз, старый аддон выключается.
+-- До /reload работает старый, а RapDiss молчит, иначе дисы двоились бы.
+function ns.MigrateFromOld()
+    local old, oldChar = _G.LumenDissDB, _G.LumenDissCharDB
+    if type(old) == "table" and not RapDissDB.imported then
+        if type(RapDissDB.settings) ~= "table" and type(old.settings) == "table" then RapDissDB.settings = Copy(old.settings) end
+        if (type(RapDissDB.guild) ~= "table" or next(RapDissDB.guild) == nil) and type(old.guild) == "table" then
+            RapDissDB.guild = Copy(old.guild)
+        end
+        RapDissDB.imported = true
+    end
+    if type(oldChar) == "table" and not RapDissCharDB.imported and (tonumber(RapDissCharDB.count) or 0) == 0 then
+        for k, v in pairs(oldChar) do RapDissCharDB[k] = Copy(v) end
+        RapDissCharDB.imported = true
+    end
+    local disable = (C_AddOns and C_AddOns.DisableAddOn) or DisableAddOn
+    if disable then pcall(disable, OLD_ADDON) end
+    ns.passive = true
+    Print("это новое имя Lumen Diss. Перенес статистику и выключил старый аддон. Сделай /reload, и дисы пойдут от RapDiss. Папку LumenDiss в AddOns можно удалить.")
+end
+
+local function Init()
+    RapDissDB = type(RapDissDB) == "table" and RapDissDB or {}
+    RapDissCharDB = type(RapDissCharDB) == "table" and RapDissCharDB or {}
+    if OldLoaded() then ns.MigrateFromOld() end
+    DB, CharDB = RapDissDB, RapDissCharDB
+    DB.settings = type(DB.settings) == "table" and DB.settings or {}
+    for k, v in pairs(DEFAULTS) do
+        if type(DB.settings[k]) ~= type(v) then DB.settings[k] = v end
+    end
+    for k, lim in pairs(LIMITS) do
+        if DB.settings[k] < lim[1] or DB.settings[k] > lim[2] then DB.settings[k] = DEFAULTS[k] end
+    end
+    if StyleOf(DB.settings.bubbleStyle).key ~= DB.settings.bubbleStyle then DB.settings.bubbleStyle = DEFAULTS.bubbleStyle end
+    DB.guild = type(DB.guild) == "table" and DB.guild or {}
     CharDB.count = CharDB.count or 0
     CharDB.byMob = CharDB.byMob or {}
     CharDB.namedSeen = type(CharDB.namedSeen) == "table" and CharDB.namedSeen or {}
@@ -848,8 +1071,15 @@ end
 
 ev:SetScript("OnEvent", function(_, e, a1, a2, a3, a4)
     if e == "ADDON_LOADED" then
-        if a1 == ADDON then Init() end
-    elseif e == "CHAT_MSG_ADDON" then
+        if a1 == ADDON then
+            Init()
+        elseif a1 == OLD_ADDON and DB and not ns.passive then
+            ns.MigrateFromOld()       -- старый загрузился позже нового
+        end
+        return
+    end
+    if not DB or ns.passive then return end
+    if e == "CHAT_MSG_ADDON" then
         ns.OnAddonMessage(a1, a2, a3, a4)
     elseif e == "PLAYER_TARGET_CHANGED" then
         CacheTarget()
